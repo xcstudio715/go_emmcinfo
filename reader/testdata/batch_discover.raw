@@ -1,0 +1,10 @@
+###HOSTS
+mmc0  mmc1
+###DEVS mmc0
+device  mmc0:0001  power  subsystem  uevent
+###TYPE mmc0/mmc0:0001
+MMC
+###DEVS mmc1
+device  mmc1:0001  power  subsystem  uevent
+###TYPE mmc1/mmc1:0001
+SD

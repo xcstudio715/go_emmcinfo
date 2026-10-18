@@ -1,0 +1,6 @@
+dm-0   dm-5   loop1   loop15  loop7         mmcblk1  ram13  ram5
+dm-1   dm-6   loop10  loop2   loop8         ram0     ram14  ram6
+dm-10  dm-7   loop11  loop3   loop9         ram1     ram15  ram7
+dm-2   dm-8   loop12  loop4   mmcblk0       ram10    ram2   ram8
+dm-3   dm-9   loop13  loop5   mmcblk0boot0  ram11    ram3   ram9
+dm-4   loop0  loop14  loop6   mmcblk0boot1  ram12    ram4   zram0
