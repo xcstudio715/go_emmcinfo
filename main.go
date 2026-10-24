@@ -33,7 +33,9 @@ func logPanic() {
 func main() {
 	defer logPanic()
 
-	a := app.New()
+	// 必须用 NewWithID：无唯一 ID 的 app.New() 的 Preferences 为纯内存实现，
+	// 不落盘（%APPDATA%\fyne\<ID>\preferences.json），且每次访问打 "unique ID" 告警。
+	a := app.NewWithID("io.github.xchejin.go-emmcinfo")
 	a.Settings().SetTheme(ui.NotoTheme{})
 	ui.NewApp(a).Run()
 }

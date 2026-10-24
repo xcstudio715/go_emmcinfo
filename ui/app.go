@@ -59,6 +59,12 @@ type App struct {
 	readBtn   *widget.Button
 	exportBtn *widget.Button
 
+	// root 模式（设置页）：useRoot 为 collect 的总开关；rootCheck 为设置页开关控件；
+	// rootGuard 用于程序化 SetChecked 时屏蔽手动切换状态机（见 settings.go）。
+	useRoot   bool
+	rootCheck *widget.Check
+	rootGuard bool
+
 	last    ReportInput
 	hasLast bool
 	busy    bool
@@ -121,6 +127,7 @@ func NewApp(a fyne.App) *App {
 		container.NewTabItem("分区容量", container.NewScroll(ui.partTab.Entry)),
 		container.NewTabItem("详细", container.NewScroll(ui.detailTab.Entry)),
 		container.NewTabItem("关于", container.NewScroll(aboutTab.Entry)),
+		container.NewTabItem("设置", ui.buildSettingsTab()),
 	)
 
 	ui.win.SetContent(container.NewBorder(top, nil, nil, nil, tabs))
@@ -188,7 +195,7 @@ func (a *App) ReadAll() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		in, err := collect(platform, serial, func(p reader.Progress) {
+		in, err := collect(platform, serial, a.useRoot, func(p reader.Progress) {
 			fyne.Do(func() {
 				a.prog = p
 				if a.busy {
@@ -209,6 +216,9 @@ func (a *App) ReadAll() {
 			a.render(in)
 			a.exportBtn.Enable()
 			a.setStatus(fmt.Sprintf("读取完成（用时 %.1f 秒）", time.Since(start).Seconds()))
+			// 寿命支持提示：在"读取完成"状态更新之后判定；SDK 查询与弹窗均异步，
+			// 不得阻塞/覆盖读取完成状态（见 settings.go maybeNoticeLifetime）。
+			a.maybeNoticeLifetime(in)
 		})
 	}()
 
@@ -282,19 +292,19 @@ func (a *App) setStatus(s string) {
 }
 
 // collect 按平台选择执行读取。全部为包级纯逻辑，便于将来单测。
-func collect(platform, serial string, progress reader.ProgressFunc) (ReportInput, error) {
+func collect(platform, serial string, useRoot bool, progress reader.ProgressFunc) (ReportInput, error) {
 	switch platform {
 	case platformLocal:
 		return readLocal(progress)
 	case platformAndroid:
-		return readAndroid(serial, progress)
+		return readAndroid(serial, useRoot, progress)
 	default: // 自动：本机可用则优先本机（仅 Linux），失败再回退 Android。
 		if reader.LocalSupported() {
 			if in, err := readLocal(progress); err == nil {
 				return in, nil
 			}
 		}
-		return readAndroid(serial, progress)
+		return readAndroid(serial, useRoot, progress)
 	}
 }
 
@@ -304,8 +314,9 @@ const androidStages = 3
 // readAndroid 经 ADB 发现 mmc 设备并读取全部字段、块设备与分区表。
 //
 // adb 进程启动次数目标 ≤3：devices(1，单次读取内缓存) + 发现(1) + 字段+block+分区表(1)。
+// useRoot=true 时批量读取优先走 root 链（su -c），失败自动回退普通链（见 reader.ReadAllBatched）。
 // 批量失败时降级为逐字段 ReadAll + DiscoverBlock + ShellCat(/proc/partitions) 回退路径。
-func readAndroid(serial string, progress reader.ProgressFunc) (ReportInput, error) {
+func readAndroid(serial string, useRoot bool, progress reader.ProgressFunc) (ReportInput, error) {
 	if progress != nil {
 		progress(reader.Progress{Stage: 1, Total: androidStages, Name: "列出设备"})
 	}
@@ -314,6 +325,7 @@ func readAndroid(serial string, progress reader.ProgressFunc) (ReportInput, erro
 		return ReportInput{}, err
 	}
 	c := reader.NewAdbClient(adbPath, serial, nil)
+	c.UseRoot = useRoot
 
 	devs, derr := c.Devices()
 	if derr != nil && len(devs) == 0 {

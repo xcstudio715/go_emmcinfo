@@ -3,6 +3,7 @@ package reader
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 	"sync"
@@ -76,6 +77,11 @@ type AdbClient struct {
 	Serial string
 	Runner Runner
 
+	// UseRoot 为 true 时，批量读取优先经设备端 `su -c` 以 root 执行（见 ReadAllBatched）。
+	// root 链失败时自动回退原有非 root 脚本链，并置 BatchResult.RootDegraded=true。
+	// 发现脚本（discoverScript*）不受影响：sysfs 目录枚举无需 root。
+	UseRoot bool
+
 	// devices 结果在单个客户端（即"单次读取"）内缓存，避免重复调用 adb devices。
 	devMu  sync.Mutex
 	devSet bool
@@ -132,6 +138,26 @@ func (c *AdbClient) ShellLs(dir string) (string, error) {
 // ShellScript 执行 `adb shell <script>`：整段设备端脚本作为**单个参数**传入。
 func (c *AdbClient) ShellScript(script string) (string, error) {
 	return c.run("shell", script)
+}
+
+// CheckRoot 探测目标设备 root 可用性。
+//
+// 执行 `su -c id`（参数列表形式，无 sh -c 拼接）：合并输出含 "uid=0" 判成功；
+// 否则返回 false，错误信息**携带原始输出**（未装 su / 未授权 / 授权被拒等
+// 原因都在输出里，如实上抛给 UI 展示）。合并输出含 uid=0 即命中——execRunner
+// 用 CombinedOutput，stdout/stderr 合流后关键字仍可匹配。
+func CheckRoot(c *AdbClient) (bool, error) {
+	out, err := c.run("shell", "su", "-c", "id")
+	if strings.Contains(out, "uid=0") {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("su -c id 失败: %v (原始输出: %q)", err, out)
+	}
+	if strings.TrimSpace(out) == "" {
+		return false, errors.New("su -c id 无输出（设备可能未安装 su）")
+	}
+	return false, fmt.Errorf("su -c id 未返回 uid=0 (原始输出: %q)", out)
 }
 
 // unreadableKeywords 为各机型/内核常见的"节点不可读"错误关键字。

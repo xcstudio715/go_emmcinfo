@@ -858,6 +858,234 @@ func TestLocalReadUnsupported(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// root 模式：黄金基线 / root 脚本结构 / root 降级链 / CheckRoot
+// ---------------------------------------------------------------------------
+
+// 黄金基线：UseRoot=false 时生成的两份脚本必须与改前逐字节一致。
+// 任何改动若破坏本测试，即破坏了对既有真机行为（557.4ms 基线）的兼容承诺。
+func TestBatchReadScriptsGoldenBaseline(t *testing.T) {
+	const deviceDir = "/sys/class/mmc_host/mmc0/mmc0:0001"
+	const wantFast = `d=/sys/class/mmc_host/mmc0/mmc0:0001; for f in name cid rev manfid oemid hwrev fwrev serial date life_time pre_eol_info; do echo "###$f"; if [ -r "$d/$f" ]; then while IFS= read -r l || [ -n "$l" ]; do echo "$l"; done < "$d/$f"; else cat "$d/$f" 2>&1; fi; echo; done; echo '###@block'; ls "$d/block/" 2>/dev/null; echo '###@partitions'; cat /proc/partitions 2>&1`
+	const wantSlow = `d=/sys/class/mmc_host/mmc0/mmc0:0001; for f in name cid rev manfid oemid hwrev fwrev serial date life_time pre_eol_info; do echo "###$f"; cat "$d/$f" 2>&1; echo; done; echo '###@block'; ls "$d/block/" 2>/dev/null; echo '###@partitions'; cat /proc/partitions 2>&1`
+	if got := batchReadScriptFast(deviceDir); got != wantFast {
+		t.Errorf("batchReadScriptFast 与黄金基线不一致:\n got: %s\nwant: %s", got, wantFast)
+	}
+	if got := batchReadScript(deviceDir); got != wantSlow {
+		t.Errorf("batchReadScript 与黄金基线不一致:\n got: %s\nwant: %s", got, wantSlow)
+	}
+}
+
+// root 脚本结构约束：外层 su -c '...' 包裹；内层不得含单引号；
+// 内层与 fast 脚本仅差段标记的引号（单→双，输出字节不变）。
+func TestBatchReadScriptRootStructure(t *testing.T) {
+	const deviceDir = "/sys/class/mmc_host/mmc0/mmc0:0001"
+	s := batchReadScriptRoot(deviceDir)
+	if !strings.HasPrefix(s, "su -c '") || !strings.HasSuffix(s, "'") {
+		t.Fatalf("root 脚本须以 su -c ' 开头、' 结尾, got: %s", firstN(s, 60))
+	}
+	inner := strings.TrimSuffix(strings.TrimPrefix(s, "su -c '"), "'")
+	if strings.Contains(inner, "'") {
+		t.Errorf("root 脚本内层不得含单引号（会截断 su -c 参数）: %s", firstN(inner, 80))
+	}
+	if strings.Contains(deviceDir, "'") == false && strings.Contains(inner, deviceDir) == false {
+		t.Errorf("内层应包含 deviceDir")
+	}
+	// 与 fast 脚本逐字节对拍：仅两处段标记引号不同。
+	want := batchReadScriptFast(deviceDir)
+	want = strings.Replace(want, `echo '###@block'`, `echo "###@block"`, 1)
+	want = strings.Replace(want, `echo '###@partitions'`, `echo "###@partitions"`, 1)
+	if inner != want {
+		t.Errorf("root 内层应与 fast 脚本仅差段标记引号:\n got: %s\nwant: %s", inner, want)
+	}
+}
+
+// root 降级链：root 成功只用 root 脚本；root 失败/分段不完整 → 回退普通链并置 RootDegraded；
+// 非 root 时绝不调用 root 脚本。
+func TestReadAllBatchedRootPath(t *testing.T) {
+	const deviceDir = "/sys/class/mmc_host/mmc0/mmc0:0001"
+	rootScript := batchReadScriptRoot(deviceDir)
+	fastScript := batchReadScriptFast(deviceDir)
+	good := readFixture(t, "batch_fields.raw")
+
+	t.Run("root成功_单次spawn", func(t *testing.T) {
+		var order []string
+		r := &fakeRunner{respond: func(args []string) (string, error) {
+			s := args[len(args)-1]
+			order = append(order, s)
+			if s == rootScript {
+				return good, nil
+			}
+			return "", errors.New("未预期调用: " + firstN(s, 40))
+		}}
+		c := NewAdbClient("adb", "", r)
+		c.UseRoot = true
+		res, err := ReadAllBatched(c, deviceDir)
+		if err != nil {
+			t.Fatalf("root 链成功不应出错: %v", err)
+		}
+		if res.RootDegraded {
+			t.Error("root 成功时 RootDegraded 应为 false")
+		}
+		if res.Raw.Name != "RE1BMB" || res.BlockName != "mmcblk0" {
+			t.Errorf("结果不正确: Name=%q BlockName=%q", res.Raw.Name, res.BlockName)
+		}
+		if len(order) != 1 || order[0] != rootScript {
+			t.Errorf("root 成功应恰好调用 1 次且为 root 脚本, 实际 %d 次: %v", len(order), r.calls)
+		}
+	})
+
+	t.Run("root执行错_回退普通链", func(t *testing.T) {
+		var order []string
+		r := &fakeRunner{respond: func(args []string) (string, error) {
+			s := args[len(args)-1]
+			order = append(order, s)
+			switch s {
+			case rootScript:
+				return "su: Permission denied", errors.New("exit status 1")
+			case fastScript:
+				return good, nil
+			}
+			return "", errors.New("未预期调用: " + firstN(s, 40))
+		}}
+		c := NewAdbClient("adb", "", r)
+		c.UseRoot = true
+		res, err := ReadAllBatched(c, deviceDir)
+		if err != nil {
+			t.Fatalf("root 失败应回退成功: %v", err)
+		}
+		if !res.RootDegraded {
+			t.Error("root 失败回退后 RootDegraded 应为 true")
+		}
+		if res.Raw.Name != "RE1BMB" {
+			t.Errorf("回退后结果不正确: Name=%q", res.Raw.Name)
+		}
+		if len(order) != 2 || order[0] != rootScript || order[1] != fastScript {
+			t.Errorf("应按 root→fast 顺序调用, 实际: %v", r.calls)
+		}
+	})
+
+	t.Run("root分段不完整_回退普通链", func(t *testing.T) {
+		r := &fakeRunner{respond: func(args []string) (string, error) {
+			switch args[len(args)-1] {
+			case rootScript:
+				return "###@block\nmmcblk0\n", nil // 缺字段分段
+			case fastScript:
+				return good, nil
+			}
+			return "", errors.New("未预期调用")
+		}}
+		c := NewAdbClient("adb", "", r)
+		c.UseRoot = true
+		res, err := ReadAllBatched(c, deviceDir)
+		if err != nil {
+			t.Fatalf("root 分段不完整应回退成功: %v", err)
+		}
+		if !res.RootDegraded {
+			t.Error("root 分段不完整回退后 RootDegraded 应为 true")
+		}
+		if len(r.calls) != 2 {
+			t.Errorf("应恰好 root+fast 两次调用, 实际 %d: %v", len(r.calls), r.calls)
+		}
+	})
+
+	t.Run("非root_不碰root脚本", func(t *testing.T) {
+		r := &fakeRunner{respond: func(args []string) (string, error) {
+			if args[len(args)-1] == rootScript {
+				t.Error("UseRoot=false 时不得调用 root 脚本")
+			}
+			return good, nil
+		}}
+		c := NewAdbClient("adb", "", r)
+		res, err := ReadAllBatched(c, deviceDir)
+		if err != nil {
+			t.Fatalf("ReadAllBatched 出错: %v", err)
+		}
+		if res.RootDegraded {
+			t.Error("非 root 路径 RootDegraded 应为 false")
+		}
+	})
+}
+
+// CheckRoot：合并输出含 uid=0 即成功；失败时错误须携带原始输出。
+func TestCheckRoot(t *testing.T) {
+	t.Run("uid0_成功", func(t *testing.T) {
+		c := NewAdbClient("adb", "SER", &fakeRunner{respond: func(args []string) (string, error) {
+			// 校验参数列表形式：adb -s SER shell su -c id（无 sh -c 拼接）。
+			want := []string{"adb", "-s", "SER", "shell", "su", "-c", "id"}
+			if len(args) != len(want) {
+				t.Errorf("参数 = %v, want %v", args, want)
+			}
+			for i := range want {
+				if args[i] != want[i] {
+					t.Errorf("args[%d] = %q, want %q", i, args[i], want[i])
+				}
+			}
+			return "uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0\n", nil
+		}})
+		ok, err := CheckRoot(c)
+		if !ok || err != nil {
+			t.Errorf("got (%v, %v), want (true, nil)", ok, err)
+		}
+	})
+
+	t.Run("合并流命中uid0", func(t *testing.T) {
+		// CombinedOutput 语义：警告信息与 uid=0 混在同一输出流中仍可命中。
+		c := NewAdbClient("adb", "", &fakeRunner{respond: func(args []string) (string, error) {
+			return "SuBinary级警告: testing\nuid=0(root) gid=0(root)\n", nil
+		}})
+		if ok, _ := CheckRoot(c); !ok {
+			t.Error("合并流含 uid=0 应判成功")
+		}
+	})
+
+	t.Run("su不存在", func(t *testing.T) {
+		c := NewAdbClient("adb", "", &fakeRunner{respond: func(args []string) (string, error) {
+			return "/system/bin/sh: su: not found\n", errors.New("exit status 127")
+		}})
+		ok, err := CheckRoot(c)
+		if ok {
+			t.Error("su 不存在应判失败")
+		}
+		if err == nil || !strings.Contains(err.Error(), "su: not found") {
+			t.Errorf("错误应携带原始输出, got %v", err)
+		}
+	})
+
+	t.Run("授权被拒", func(t *testing.T) {
+		c := NewAdbClient("adb", "", &fakeRunner{respond: func(args []string) (string, error) {
+			return "su: Permission denied\n", errors.New("exit status 1")
+		}})
+		ok, err := CheckRoot(c)
+		if ok {
+			t.Error("授权被拒应判失败")
+		}
+		if err == nil || !strings.Contains(err.Error(), "Permission denied") {
+			t.Errorf("错误应携带原始输出, got %v", err)
+		}
+	})
+}
+
+// BenchmarkReadAllBatchedNoRoot 验证 UseRoot=false 路径无额外开销：
+// 固定假 Runner，度量解析与结果组装本身的耗时（不含真实 adb 进程）。
+func BenchmarkReadAllBatchedNoRoot(b *testing.B) {
+	const deviceDir = "/sys/class/mmc_host/mmc0/mmc0:0001"
+	raw, err := os.ReadFile(filepath.Join("testdata", "batch_fields.raw"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	c := NewAdbClient("adb", "", &fakeRunner{respond: func(args []string) (string, error) {
+		return string(raw), nil
+	}})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := ReadAllBatched(c, deviceDir); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // 小工具
 // ---------------------------------------------------------------------------
 

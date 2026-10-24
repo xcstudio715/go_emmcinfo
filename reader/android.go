@@ -374,6 +374,27 @@ func batchReadScriptFast(deviceDir string) string {
 		`; echo '` + sectionMarker + `@partitions'; cat /proc/partitions 2>&1`
 }
 
+// batchReadScriptRoot 为 **root 版一级脚本**：整段经设备端 `su -c '...'` 以 root 执行。
+//
+// 字段读取沿用一级 fast（c_echo）的内建 read 方案（[ -r ] 前置守卫 + 内建 read 回放），
+// 分段结构与普通脚本完全一致（11 字段 + @block + @partitions），输出逐字节等价——
+// 唯一差异是段标记 echo 改用**双引号**：外层 su -c 以单引号包裹整段脚本，
+// **内层不得再出现单引号**，故 `echo '###@block'` 改写为输出完全相同的 `echo "###@block"`。
+//
+// 单引号的作用：host 侧（adb shell 的 sh）不展开 $d/$f/$l，变量展开发生在
+// su 拉起的 root shell 内。deviceDir 已过 validateDeviceDir 白名单（不含单引号），
+// 可安全拼接。
+func batchReadScriptRoot(deviceDir string) string {
+	inner := `d=` + deviceDir +
+		`; for f in ` + strings.Join(androidFields, " ") +
+		`; do echo "` + sectionMarker + `$f"` +
+		`; if [ -r "$d/$f" ]; then while IFS= read -r l || [ -n "$l" ]; do echo "$l"; done < "$d/$f"` +
+		`; else cat "$d/$f" 2>&1; fi; echo; done` +
+		`; echo "` + sectionMarker + `@block"; ls "$d/block/" 2>/dev/null` +
+		`; echo "` + sectionMarker + `@partitions"; cat /proc/partitions 2>&1`
+	return `su -c '` + inner + `'`
+}
+
 // batchSectionsComplete 校验一次批读响应是否含全部预期分段（字段 11 + @block + @partitions）。
 //
 // 用**分段标签是否存在**判定，而非段内容是否为空——空段是合法结果（如 0 字节节点）。
@@ -403,6 +424,10 @@ type BatchResult struct {
 	// PartitionOut 为 /proc/partitions 原始输出；不可读时为空且 PartitionNote 非 nil。
 	PartitionOut  string
 	PartitionNote *FieldNote
+
+	// RootDegraded 为 true 表示 UseRoot=true 时 root 批读链失败（执行错误或分段不完整），
+	// 已自动回退原有非 root 脚本链完成本次读取。
+	RootDegraded bool
 }
 
 // ReadAllBatched 用**一条** adb shell（而非每字段一次）批读字段 + block + 分区表。
@@ -416,28 +441,46 @@ type BatchResult struct {
 //   - 段内容命中 unreadableKeywords（Permission denied 等）→ 不可读，原因为该关键字；
 //   - 其余 → 视为字段值。
 //
-// 返回的 error 仅表示"整条批量调用本身失败"（一级与二级脚本均失败），
+// 返回的 error 仅表示"整条批量调用本身失败"（root 链（若启用）与一、二级脚本均失败），
 // 调用方应据此**降级**到逐字段 ReadAll + DiscoverBlock 回退路径（第三级）。
 //
-// 三级降级链：batchReadScriptFast（c_echo）→ batchReadScript（a_echo）→ 调用方逐字段 ReadAll。
+// 降级链：
+//   - UseRoot=false（原有路径，行为与脚本逐字节不变）：
+//     batchReadScriptFast（c_echo）→ batchReadScript（a_echo）→ 调用方逐字段 ReadAll；
+//   - UseRoot=true：batchReadScriptRoot（su -c 包裹 c_echo）→ 失败/分段不完整则置
+//     RootDegraded=true 并回退上述原有两级链 → 调用方逐字段 ReadAll。
 func ReadAllBatched(c *AdbClient, deviceDir string) (BatchResult, error) {
 	if err := validateDeviceDir(deviceDir); err != nil {
 		return BatchResult{}, err
 	}
-	out, err := c.ShellScript(batchReadScriptFast(deviceDir))
+	rootDegraded := false
+
+	var out string
+	var err error
+	if c.UseRoot {
+		// root 优先：root 链成功且分段完整则直接采用。
+		out, err = c.ShellScript(batchReadScriptRoot(deviceDir))
+		if err != nil || !batchSectionsComplete(out) {
+			rootDegraded = true
+			out, err = c.ShellScript(batchReadScriptFast(deviceDir))
+		}
+	} else {
+		out, err = c.ShellScript(batchReadScriptFast(deviceDir))
+	}
 	if err != nil || !batchSectionsComplete(out) {
 		// 一级失败（执行错误 / 分段不完整）→ 退到二级 a_echo（逐字段 cat）。
 		out, err = c.ShellScript(batchReadScript(deviceDir))
 		if err != nil {
-			return BatchResult{}, fmt.Errorf("批量读取失败（一级与二级脚本均失败）: %v (原始输出: %q)", err, out)
+			return BatchResult{}, fmt.Errorf("批量读取失败（脚本链均失败）: %v (原始输出: %q)", err, out)
 		}
 		if !batchSectionsComplete(out) {
-			return BatchResult{}, fmt.Errorf("批量读取分段不完整（一级与二级脚本均失败）(原始输出: %q)", out)
+			return BatchResult{}, fmt.Errorf("批量读取分段不完整（脚本链均失败）(原始输出: %q)", out)
 		}
 	}
 	content := parseSections(out)
 
 	var res BatchResult
+	res.RootDegraded = rootDegraded
 	for _, key := range androidFields {
 		node := deviceDir + "/" + key
 		val := strings.TrimSpace(content[key])

@@ -380,6 +380,43 @@ func Interpret(raw model.RawInfo) Result {
 }
 
 // ---------------------------------------------------------------------------
+// 寿命字段支持判定
+// ---------------------------------------------------------------------------
+
+// LifetimeSupport 判定设备是否支持寿命字段（life_time / pre_eol_info）。
+//
+// 判定输入：
+//   - sdk：Android API 级别（ro.build.version.sdk）。sdk < 0 表示未知（未查询 /
+//     查询失败），该项**不参与判定**，不因未知而判不支持；
+//   - revRaw：sysfs rev 节点原文（如 "0x8"）。为空或无法解析为十六进制时，
+//     该项同样**不参与判定**。
+//
+// 判定规则（life_time / pre_eol_info 为 eMMC 5.0 引入；Android 8.0 / API 26 起
+// 内核才普遍向应用暴露这些节点）：
+//   - sdk >= 0 且 sdk < 26          → 不支持，原因含 "Android"；
+//   - rev 可解析且 EXT_CSD_REV <= 6 → 不支持，原因含 "eMMC"；
+//   - 两者同时成立                  → 原因合并（同时含 "Android" 与 "eMMC"）。
+//
+// 返回 (是否支持, 不支持原因)；支持时原因为空串。纯函数，仅依赖本包。
+func LifetimeSupport(sdk int, revRaw string) (bool, string) {
+	var reasons []string
+	if sdk >= 0 && sdk < 26 {
+		reasons = append(reasons,
+			fmt.Sprintf("Android 版本过低（SDK %d < 26），系统未暴露寿命节点", sdk))
+	}
+	if t := strings.TrimSpace(revRaw); t != "" {
+		if n, ok := NormalizeHexByte(t); ok && n <= 6 {
+			reasons = append(reasons,
+				fmt.Sprintf("eMMC 版本过低（EXT_CSD_REV 0x%x <= 6，低于 eMMC 5.0），未定义寿命字段", n))
+		}
+	}
+	if len(reasons) == 0 {
+		return true, ""
+	}
+	return false, strings.Join(reasons, "；")
+}
+
+// ---------------------------------------------------------------------------
 // 内部工具
 // ---------------------------------------------------------------------------
 

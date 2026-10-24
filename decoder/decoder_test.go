@@ -372,3 +372,64 @@ func TestInterpretManfIDUnreadableFallback(t *testing.T) {
 		t.Errorf("其它字段不应被中断: LifeTimeSLC=%q", res.LifeTimeSLC)
 	}
 }
+
+// LifetimeSupport 表驱动：sdk × rev 组合 + 未知输入。
+// 只断言原因中的关键词（Android / eMMC），不断言完整文案。
+func TestLifetimeSupport(t *testing.T) {
+	tests := []struct {
+		name        string
+		sdk         int
+		rev         string
+		wantSupport bool
+		wantSub     []string // 不支持时原因必须包含的关键词
+		wantNotSub  []string // 不支持时原因必须不包含的关键词
+	}{
+		// sdk 25/26/30/-1 × rev 0x5/0x6/0x7/0x8。
+		{"sdk25_rev5_双低", 25, "0x5", false, []string{"Android", "eMMC"}, nil},
+		{"sdk25_rev6_双低", 25, "0x6", false, []string{"Android", "eMMC"}, nil},
+		{"sdk25_rev7_仅Android", 25, "0x7", false, []string{"Android"}, []string{"eMMC"}},
+		{"sdk25_rev8_仅Android", 25, "0x8", false, []string{"Android"}, []string{"eMMC"}},
+		{"sdk26_rev5_仅eMMC", 26, "0x5", false, []string{"eMMC"}, []string{"Android"}},
+		{"sdk26_rev6_仅eMMC", 26, "0x6", false, []string{"eMMC"}, []string{"Android"}},
+		{"sdk26_rev7_支持", 26, "0x7", true, nil, nil},
+		{"sdk26_rev8_支持", 26, "0x8", true, nil, nil},
+		{"sdk30_rev5_仅eMMC", 30, "0x5", false, []string{"eMMC"}, []string{"Android"}},
+		{"sdk30_rev8_支持", 30, "0x8", true, nil, nil},
+		// sdk 未知（<0）：该项不参与判定，不因未知而判不支持。
+		{"sdk未知_rev5_仅eMMC", -1, "0x5", false, []string{"eMMC"}, []string{"Android"}},
+		{"sdk未知_rev7_支持", -1, "0x7", true, nil, nil},
+		// rev 为空 / 不可读 / 乱串：该项不参与判定。
+		{"rev空_sdk25_仅Android", 25, "", false, []string{"Android"}, []string{"eMMC"}},
+		{"rev空_sdk26_支持", 26, "", true, nil, nil},
+		{"rev空_sdk未知_支持", -1, "", true, nil, nil},
+		{"rev不可读_sdk26_支持", 26, model.Unreadable, true, nil, nil},
+		{"rev乱串_sdk25_仅Android", 25, "xyz", false, []string{"Android"}, []string{"eMMC"}},
+		{"rev乱串_sdk26_支持", 26, "xyz", true, nil, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			support, reason := LifetimeSupport(tc.sdk, tc.rev)
+			if support != tc.wantSupport {
+				t.Fatalf("LifetimeSupport(sdk=%d, rev=%q) support=%v, want %v (reason=%q)",
+					tc.sdk, tc.rev, support, tc.wantSupport, reason)
+			}
+			if !tc.wantSupport {
+				if reason == "" {
+					t.Fatalf("不支持时原因为空")
+				}
+				for _, sub := range tc.wantSub {
+					if !strings.Contains(reason, sub) {
+						t.Errorf("reason = %q, want contains %q", reason, sub)
+					}
+				}
+				for _, sub := range tc.wantNotSub {
+					if strings.Contains(reason, sub) {
+						t.Errorf("reason = %q, want NOT contains %q", reason, sub)
+					}
+				}
+			} else if reason != "" {
+				t.Errorf("支持时原因应为空串, got %q", reason)
+			}
+		})
+	}
+}
